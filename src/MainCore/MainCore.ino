@@ -13,20 +13,24 @@
 #include <RTC.h>
 #include <OneKeySynthesizerFilter.h>
 #include <SFZSink.h>
+#include "OutputMixer.h"
 
-static bool doJump = false;       // ユーザーがジャンプをしたかどうか True = ジャンプをした false = ジャンプをしていない
-static bool inRing = false;       // ユーザーの足がリング内に存在しているかどうか True = 入っている false = 入っていない
-static bool doPlaySound = false;  // sound再生を実行しているかどうか True = sound再生中 false = sound停止中
-static uint32_t soundPlayTime;    // TODO変えるかも
+static bool doJump = false;         // ユーザーがジャンプをしたかどうか True = ジャンプをした false = ジャンプをしていない
+static bool inRing = false;         // ユーザーの足がリング内に存在しているかどうか True = 入っている false = 入っていない
+static bool doPlaySound = false;    // sound再生を実行しているかどうか True = sound再生中 false = sound停止中
+static uint32_t soundPlayTime = 0;  // TODO変えるかも
 
 // サブコア制御用変数
-static uint32_t snddata = 1;  //random(32767);
-static uint32_t rcvdata;
-static int8_t rcvid;
+static uint32_t snddata = 1;
+static uint32_t rcvdata = 0;
+static uint32_t preRcvdata = 0;
+static int8_t rcvid = 0;
+static int8_t msgId = 0;
+static bool isCallAcceleration = false;
+
 
 // サブコア制御用
 const int SUBCORE = 1;  // Communication with SUBCORE2 1は音楽再生ライブラリにて利用するかも
-const int USER_MSG_ID = 100;
 const int TIMEOUT_MS = 1000;
 
 // 音楽制御用
@@ -35,7 +39,7 @@ const uint8_t PLAY_CHANNEL = 1;
 //画像認識AI用
 const int DNN_WIDTH = 96;
 const int DNN_HEIGHT = 72;
-const int IN_RING = 1;  // ただのラベル 0 = リング内に入っている。リング内に入ってない...なんだけどなんかAIバグってて逆の数値になっているから1をリンクインとして判定する　
+const int IN_RING = 0;  // ただのラベル 0 = リング内に入っている。リング内に入ってない
 
 static SFZSink sink("SawLpf.sfz");
 OneKeySynthesizerFilter *inst;
@@ -57,43 +61,26 @@ void checkMemory(const char *additionalInfo) {
 /* サブコア関連処理*/
 void initSubCore() {
   int ret = MP.begin(SUBCORE);
+  // MP.RecvTimeout(MP_RECV_POLLING);
   if (ret < 0) {
     Serial.println("MP.begin error = " + String(ret));
   }
-  randomSeed(100);
 }
 
 void getAccelerationData() {
-  Serial.println("Send: id=" + String(USER_MSG_ID) + " data=0x" + String(snddata, HEX));
-
-  int ret = MP.Send(USER_MSG_ID, snddata, SUBCORE);
+  Serial.println("Send: id=" + String(msgId) + " data=0x" + String(snddata, HEX));
+  int ret = 0;
+  ret = MP.Send(msgId, snddata, SUBCORE);
   if (ret < 0) {
     Serial.println("MP.Send error = " + String(ret));
   }
-
-  MP.RecvTimeout(TIMEOUT_MS);
-
+  MP.RecvTimeout(40);
   ret = MP.Recv(&rcvid, &rcvdata, SUBCORE);
   if (ret < 0) {
     Serial.println("MP.Recv error = " + String(ret));
   }
-
   Serial.println("Recv: id=" + String(rcvid) + " data=0x" + String(rcvdata, HEX) + " : " + ((snddata == rcvdata) ? "Success" : "Fail"));
   Serial.println("Acceleration: 0x" + String(rcvdata, HEX));
-}
-
-
-/* 音楽再生処理 */
-// めちゃくちゃカメラの処理と競合するのでフラグを使って排他制御をかけている（しょぼい）
-// 競合するとメモリ壊れたり写真が取れなくなったり音が再生されない
-// でも多分音が壊れる原因はinst->update();がコールされないことなのでタイマーで割り込み処理入れてあげればある程度解決する可能性あり
-void startSound() {
-  if (!doPlaySound) {
-    doPlaySound = true;
-    soundPlayTime = RTC.getTime().unixtime();
-    printf("soundPlayTime is %d\n", soundPlayTime);
-    inst->sendNoteOn(OneKeySynthesizerFilter::NOTE_ALL, DEFAULT_VELOCITY, PLAY_CHANNEL);
-  }
 }
 
 // 指定時刻に応じて音楽再生時間を変更する
@@ -103,6 +90,22 @@ void stopSound(uint32_t stopTime = 2) {
   if (doPlaySound && elapsedTime >= stopTime /*サウンド起動からの経過時間(s)*/) {
     doPlaySound = false;
     inst->sendNoteOff(OneKeySynthesizerFilter::NOTE_ALL, DEFAULT_VELOCITY, PLAY_CHANNEL);
+  }
+}
+
+/* 音楽再生処理 */
+// めちゃくちゃカメラの処理と競合するのでフラグを使って排他制御をかけている（しょぼい）
+// 競合するとメモリ壊れたり写真が取れなくなったり音が再生されない
+// でも多分音が壊れる原因はinst->update();がコールされないことなのでタイマーで割り込み処理入れてあげればある程度解決する可能性あり
+void startSound() {
+  doPlaySound = false;
+  inst->sendNoteOff(OneKeySynthesizerFilter::NOTE_ALL, DEFAULT_VELOCITY, PLAY_CHANNEL);
+  if (!doPlaySound) {
+    doPlaySound = true;
+    soundPlayTime = RTC.getTime().unixtime();
+    printf("soundPlayTime is %d\n", soundPlayTime);
+    inst->setParam(Filter::PARAMID_OUTPUT_LEVEL, 120);
+    inst->sendNoteOn(OneKeySynthesizerFilter::NOTE_ALL, 64, PLAY_CHANNEL);
   }
 }
 
@@ -204,10 +207,10 @@ void setup() {
   checkMemory("start ###############################");
   RTC.begin();
   checkMemory("RTC ###############################");
-  initSubCore();
   checkMemory("initSubCore ###############################");
   initSound();
   checkMemory("initSound ###############################");
+  initSubCore();
   initCamera();
   checkMemory("initCamera ###############################");
   checkMemory("end ###############################");
@@ -220,9 +223,11 @@ void loop() {
   stopSound();
 
   // 平均加速度の取得
+  rcvdata = 0;
   getAccelerationData();
+
   // 加重平均加速度の合計値がxx以上であればユーザーがジャンプをしたと判断する
-  doJump = (rcvdata >= 10) ? true : false;
+  doJump = (rcvdata >= 25) ? true : false;
   if (!doJump) {
     return;
   }
